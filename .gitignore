@@ -3,3 +3,6 @@ desktop.ini
 .DS_Store
 *.bak
 *.tmp
+.claude/
+node_modules/
+.vercel/

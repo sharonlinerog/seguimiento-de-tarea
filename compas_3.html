@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Compás</title>
+<title>Toma28P</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;0,9..144,700;1,9..144,500&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -413,7 +413,7 @@
 <script id="app-script">
 "use strict";
 /* =========================================================================
-   Compás — seguimiento de tareas de equipo
+   Toma28P — seguimiento de tareas de equipo
    Estado compartido vía la capacidad "artifact"; notificaciones por correo
    vía la capacidad "mcp" (conector de Gmail del visor).
    ========================================================================= */
@@ -540,32 +540,93 @@ function safeUse(name){
     return Promise.resolve(null);
   }
 }
+/* ---------------------------- persistencia (Neon vía /api/state) ----------------------------
+   El documento completo vive en Postgres (Neon). SAVE_VERSION guarda la versión
+   que este cliente cree vigente; el servidor rechaza con 409 si alguien más
+   escribió primero, y entonces adoptamos la versión ganadora en vez de pisarla. */
+
+var SAVE_VERSION = null;
+var saveQueue = Promise.resolve();
+
+function adoptServerDoc(payload){
+  SAVE_VERSION = payload.version;
+  var doc = payload.doc;
+  if(doc && typeof doc === 'object'){
+    STATE = doc;
+    if(!STATE.people)   STATE.people = [];
+    if(!STATE.projects) STATE.projects = [];
+    if(!STATE.tasks)    STATE.tasks = [];
+    if(!STATE.boards || !STATE.boards.length) STATE.boards = [{ id:'board_general', name:'General' }];
+    if(!boardById(UI.currentBoard)) UI.currentBoard = STATE.boards[0].id;
+  }
+}
+
+function apiError(r){
+  return r.json().catch(function(){ return {}; }).then(function(p){
+    throw new Error(p.error || ('HTTP ' + r.status));
+  });
+}
+
+function loadFromServer(){
+  return fetch('/api/state', { headers:{ 'Accept':'application/json' } }).then(function(r){
+    if(!r.ok) return apiError(r);
+    return r.json();
+  }).then(function(payload){
+    adoptServerDoc(payload);
+    UI.readOnly = false;
+    render();
+    return true;
+  }).catch(function(err){
+    UI.readOnly = true;
+    render();
+    console.error('Toma28P: no se pudo cargar el estado —', err);
+    toast('Sin conexión con la base de datos (' + ((err && err.message) || 'error de red') + '). Vista de solo lectura.', 'err');
+    return false;
+  });
+}
+
+// Las escrituras se encolan: dos cambios rápidos seguidos no compiten por la misma versión.
 function persist(successMsg){
   if(UI.readOnly) return Promise.resolve(false);
-  return safeUse('artifact').then(function(artifact){
-    if(!artifact){ return false; }
-    saving = true;
-    render();
-    STATE.updatedAt = new Date().toISOString();
-    return artifact.publish(serializeDocument(STATE)).then(function(){
-      return true;
-    }).catch(function(err){
-      saving = false;
-      if(err && err.code === 'conflict'){
-        // el visor ya se está recargando a la versión ganadora; no reintentar.
-        return false;
-      }
-      if(err && (err.code === 'not_writer' || err.code === 'not_granted')){
-        UI.readOnly = true;
+  var run = saveQueue.then(function(){ return pushToServer(successMsg); });
+  saveQueue = run.catch(function(){});
+  return run;
+}
+
+function pushToServer(successMsg){
+  if(SAVE_VERSION === null){
+    toast('Todavía no se cargó el estado desde la base de datos. Recarga la página.', 'err');
+    return Promise.resolve(false);
+  }
+  saving = true;
+  render();
+  STATE.updatedAt = new Date().toISOString();
+  return fetch('/api/state', {
+    method: 'PUT',
+    headers: { 'Content-Type':'application/json' },
+    body: JSON.stringify({ version: SAVE_VERSION, doc: STATE })
+  }).then(function(r){
+    if(r.status === 409){
+      return r.json().then(function(payload){
+        adoptServerDoc(payload);
+        saving = false;
         render();
-        toast('Esta vista es de solo lectura.', 'err');
+        toast('Otra persona guardó cambios antes. Se cargó la versión más reciente; revisa y repite tu cambio.', 'err');
         return false;
-      }
-      toast('No se pudo guardar el cambio. Intenta de nuevo.', 'err');
+      });
+    }
+    if(!r.ok) return apiError(r);
+    return r.json().then(function(payload){
+      SAVE_VERSION = payload.version;
+      saving = false;
       render();
-      return false;
+      if(successMsg) toast(successMsg, 'ok');
+      return true;
     });
-  }).catch(function(){
+  }).catch(function(err){
+    saving = false;
+    render();
+    toast('No se pudo guardar: ' + ((err && err.message) || 'error de red'), 'err');
     return false;
   });
 }
@@ -577,7 +638,7 @@ function serializeDocument(state){
   var head =
     '<!doctype html>\n<html lang="es">\n<head>\n' +
     '<meta charset="utf-8" />\n<meta name="viewport" content="width=device-width, initial-scale=1" />\n' +
-    '<title>Compás</title>\n' +
+    '<title>Toma28P</title>\n' +
     '<link rel="preconnect" href="https://fonts.googleapis.com">\n' +
     '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n' +
     '<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;0,9..144,700;1,9..144,500&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">\n' +
@@ -611,20 +672,18 @@ function taskEmailBody(task, person){
     'Proyecto: ' + (proj ? proj.name : 'Sin proyecto'),
     'Prioridad: ' + (PRIORITY_DEFS.find(function(p){return p.id===task.priority;}) || {}).label
   ];
-  if(task.client) details.push('Cliente / empresa: ' + task.client);
-  if(task.platform) details.push('Plataforma educativa: ' + task.platform);
   if(task.startDate) details.push('Fecha de inicio: ' + fmtDate(task.startDate));
   details.push('Fecha límite: ' + (task.dueDate ? fmtDate(task.dueDate) : 'Sin definir'));
 
   var lines = [
     'Hola ' + (person.name || '') + ',',
     '',
-    'Se te asignó una tarea en Compás:',
+    'Se te asignó una tarea en Toma28P:',
     '',
     details.join('\n')
   ];
   if(task.description) lines.push('', 'Descripción:', task.description);
-  if(typeof location !== 'undefined' && location.href) lines.push('', 'Ábrela en Compás: ' + location.href);
+  if(typeof location !== 'undefined' && location.href) lines.push('', 'Ábrela en Toma28P: ' + location.href);
   return lines.join('\n');
 }
 function mailtoLink(task, person){
@@ -750,7 +809,7 @@ function railHTML(){
     '<aside class="rail">' +
       '<div class="brand">' +
         '<div class="brand-mark">' + iconCompass() + '</div>' +
-        '<div><div class="brand-name">Tarea Toma28P</div><div class="brand-sub"></div></div>' +
+        '<div><div class="brand-name">Toma28P</div><div class="brand-sub"></div></div>' +
       '</div>' +
       '<button class="btn-new" data-action="new-task" title="Nueva tarea" ' + (UI.readOnly ? 'disabled' : '') + '>' + iconPlus() + ' <span>Nueva tarea</span></button>' +
       '<nav class="rail-nav">' +
@@ -936,7 +995,6 @@ function listHTML(){
       '<tr data-action="open-task" data-id="' + t.id + '">' +
         '<td>' + esc(t.title) + '</td>' +
         '<td>' + (proj ? '<span class="chip chip-project"><span class="dot" style="background:var(' + proj.colorVar + ')"></span>' + esc(proj.name) + '</span>' : '—') + '</td>' +
-        '<td>' + (t.client ? esc(t.client) : '—') + '</td>' +
         '<td>' + (person ? '<div class="assignee"><div class="avatar">' + esc(initials(person.name)) + '</div>' + esc(person.name) + '</div>' : '<span class="assignee unassigned">Sin asignar</span>') + '</td>' +
         '<td><span class="status-pill">' + st.label + '</span></td>' +
         '<td>' + (prio ? '<span class="chip ' + prio.cls + '">' + prio.label + '</span>' : '—') + '</td>' +
@@ -945,7 +1003,7 @@ function listHTML(){
         '<td>' + (tags.length ? tags.map(function(tg){ return '<span class="chip chip-tag">#' + esc(tg) + '</span>'; }).join(' ') : '—') + '</td>' +
       '</tr>'
     );
-  }).join('') : '<tr><td colspan="9"><div class="empty-state" style="padding:34px 10px;"><p>Ninguna tarea coincide con estos filtros.</p></div></td></tr>';
+  }).join('') : '<tr><td colspan="8"><div class="empty-state" style="padding:34px 10px;"><p>Ninguna tarea coincide con estos filtros.</p></div></td></tr>';
 
   return (
     '<div class="filters-row">' +
@@ -957,7 +1015,7 @@ function listHTML(){
       (hasActiveFilters ? '<button class="filters-clear" data-action="clear-filters">Limpiar filtros</button>' : '') +
     '</div>' +
     '<div class="table-wrap"><table class="tasks-table"><thead><tr>' +
-      th('title','Tarea') + '<th>Proyecto</th><th>Cliente</th>' + th('assignee','Responsable') + th('status','Estado') + th('priority','Prioridad') + th('due','Vence') + '<th>Subtareas</th><th>Etiquetas</th>' +
+      th('title','Tarea') + '<th>Proyecto</th>' + th('assignee','Responsable') + th('status','Estado') + th('priority','Prioridad') + th('due','Vence') + '<th>Subtareas</th><th>Etiquetas</th>' +
     '</tr></thead><tbody>' + rows + '</tbody></table></div>'
   );
 }
@@ -1227,10 +1285,6 @@ function taskModalHTML(){
             '<div><label class="field-label">Responsable</label><select class="field" id="t-assignee" ' + (UI.readOnly?'disabled':'') + '>' + peopleOpts + '</select></div>' +
           '</div>' +
           '<div class="form-row inline">' +
-            '<div><label class="field-label">Cliente / empresa</label><input type="text" id="t-client" value="' + esc(d.client||'') + '" placeholder="Ej. Universidad Americana" ' + (UI.readOnly?'disabled':'') + '></div>' +
-            '<div><label class="field-label">Plataforma educativa</label><input type="text" id="t-platform" value="' + esc(d.platform||'') + '" placeholder="Ej. Moodle, Canvas…" ' + (UI.readOnly?'disabled':'') + '></div>' +
-          '</div>' +
-          '<div class="form-row inline">' +
             '<div><label class="field-label">Fecha de inicio</label><input type="date" id="t-start" value="' + (d.startDate||'') + '" ' + (UI.readOnly?'disabled':'') + '></div>' +
             '<div><label class="field-label">Fecha límite</label><input type="date" id="t-due" value="' + (d.dueDate||'') + '" ' + (UI.readOnly?'disabled':'') + '></div>' +
           '</div>' +
@@ -1378,7 +1432,7 @@ function openNewTaskModal(){
     project: STATE.projects[0] ? STATE.projects[0].id : '',
     board: UI.currentBoard || defaultBoardId(),
     assignee:'', status:'por-hacer', priority:'media',
-    client:'', platform:'', startDate:'', dueDate:'',
+    startDate:'', dueDate:'',
     tags:[], links:[], subtasks:[], comments:[], createdAt:null, updatedAt:null, lastNotifiedAt:null
   };
   UI.modal = { type:'task' };
@@ -1398,8 +1452,6 @@ function saveTaskDraft(){
   d.project = document.getElementById('t-project').value;
   d.board = document.getElementById('t-board').value;
   d.assignee = document.getElementById('t-assignee').value;
-  d.client = document.getElementById('t-client').value.trim();
-  d.platform = document.getElementById('t-platform').value.trim();
   d.startDate = document.getElementById('t-start').value;
   d.dueDate = document.getElementById('t-due').value;
   d.description = document.getElementById('t-desc').value;
@@ -1419,7 +1471,7 @@ function saveTaskDraft(){
 
   var clean = {
     id:d.id, title:d.title, description:d.description, project:d.project, board:d.board||defaultBoardId(), assignee:d.assignee,
-    status:d.status, priority:d.priority, client:d.client||'', platform:d.platform||'',
+    status:d.status, priority:d.priority,
     startDate:d.startDate||'', dueDate:d.dueDate,
     tags:d.tags||[], links:d.links||[], subtasks:d.subtasks||[], comments:d.comments||[],
     createdAt:d.createdAt, updatedAt:d.updatedAt||null, lastNotifiedAt:d.lastNotifiedAt||null
@@ -1460,8 +1512,6 @@ function syncDraftFieldsFromForm(){
   el = document.getElementById('t-project');  if(el) d.project = el.value;
   el = document.getElementById('t-board');    if(el) d.board = el.value;
   el = document.getElementById('t-assignee'); if(el) d.assignee = el.value;
-  el = document.getElementById('t-client');   if(el) d.client = el.value;
-  el = document.getElementById('t-platform'); if(el) d.platform = el.value;
   el = document.getElementById('t-start');    if(el) d.startDate = el.value;
   el = document.getElementById('t-due');      if(el) d.dueDate = el.value;
   el = document.getElementById('t-desc');     if(el) d.description = el.value;
@@ -1863,7 +1913,10 @@ function bindEvents(){
 /* ---------------------------- arranque ---------------------------- */
 
 function init(){
+  // Solo lectura hasta que la base confirme: así nadie escribe sobre un estado sin cargar.
+  UI.readOnly = true;
   render();
+  loadFromServer();
 }
 
 // Algunos anfitriones (ej. vistas previas de archivos) exponen un window.claude
@@ -1873,10 +1926,10 @@ if(typeof window.claude === 'undefined' || typeof window.claude.use !== 'functio
   window.claude = { use: function(){ return Promise.resolve(null); } };
 }
 window.addEventListener('error', function(ev){
-  console.error('Compás: error no capturado —', ev.message);
+  console.error('Toma28P: error no capturado —', ev.message);
 });
 window.addEventListener('unhandledrejection', function(ev){
-  console.error('Compás: promesa rechazada sin capturar —', ev.reason);
+  console.error('Toma28P: promesa rechazada sin capturar —', ev.reason);
 });
 init();
 </script>
