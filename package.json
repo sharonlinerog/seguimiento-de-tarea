@@ -2,7 +2,7 @@
   "name": "toma28p",
   "version": "1.0.0",
   "private": true,
-  "description": "Toma28P — seguimiento de tareas de equipo, con estado persistido en Neon",
+  "description": "Toma28P — seguimiento de tareas de equipo: estado en Neon y notificaciones por correo con la cuenta de Google conectada",
   "dependencies": {
     "@neondatabase/serverless": "^1.1.0"
   }

@@ -373,6 +373,14 @@
   .mail-link:hover{ text-decoration:underline; }
   .muted-note{ font-size:11.5px; color:var(--ink-faint); }
 
+  /* Ajustes: cuenta de Google que envía las notificaciones */
+  .settings-panel{ max-width:620px; }
+  .settings-panel .notify-box{ gap:12px; padding:16px 17px; }
+  .settings-panel code{ font-family:'IBM Plex Mono',monospace; font-size:11px; background:var(--surface-hover); padding:1px 5px; border-radius:4px; }
+  .sender-account{ display:flex; align-items:center; gap:12px; padding:12px 0; border-top:1px solid var(--line); border-bottom:1px solid var(--line); }
+  .settings-list{ margin:0; padding-left:18px; display:flex; flex-direction:column; gap:7px; font-size:12.5px; color:var(--ink-soft); line-height:1.5; }
+  .btn-accent svg{ width:15px; height:15px; vertical-align:-3px; margin-right:5px; }
+
   .meta-footer{ display:flex; gap:14px; font-size:11px; color:var(--ink-faint); font-family:"IBM Plex Mono", monospace; margin-top:16px; }
 
   .checkbox-row{ display:flex; align-items:center; gap:8px; font-size:13px; }
@@ -414,8 +422,8 @@
 "use strict";
 /* =========================================================================
    Toma28P — seguimiento de tareas de equipo
-   Estado compartido vía la capacidad "artifact"; notificaciones por correo
-   vía la capacidad "mcp" (conector de Gmail del visor).
+   Estado compartido en Postgres (Neon) vía /api/state; notificaciones por
+   correo vía /api/mail, que envía con la cuenta de Google conectada en Ajustes.
    ========================================================================= */
 
 var STATE = JSON.parse(document.getElementById('app-data').textContent);
@@ -432,6 +440,14 @@ var UI = {
   confirm: null,
   notify: {},
   currentBoard: STATE.boards[0].id
+};
+
+/* Cuenta de Google desde la que salen las notificaciones. La resuelve /api/mail;
+   aquí solo vive lo que la interfaz necesita mostrar — los tokens de Google no
+   llegan nunca al navegador, se quedan en el servidor. */
+var MAIL = {
+  loaded: false, configured: false, connected: false,
+  email: null, name: null, connectedAt: null, lastError: null
 };
 
 var STATUS_DEFS = [
@@ -528,18 +544,6 @@ function nextCatColorVar(){
 /* ---------------------------- persistencia ---------------------------- */
 
 var saving = false;
-function safeUse(name){
-  // claude.use() debe ser async, pero algunos anfitriones (por ejemplo, la vista
-  // previa de archivos) exponen un window.claude incompleto que lanza de forma
-  // síncrona en vez de devolver una promesa. Nunca dejamos que eso rompa el flujo.
-  try{
-    var p = claude.use(name);
-    if(p && typeof p.then === 'function') return p;
-    return Promise.resolve(null);
-  }catch(e){
-    return Promise.resolve(null);
-  }
-}
 /* ---------------------------- persistencia (Neon vía /api/state) ----------------------------
    El documento completo vive en Postgres (Neon). SAVE_VERSION guarda la versión
    que este cliente cree vigente; el servidor rechaza con 409 si alguien más
@@ -698,41 +702,146 @@ function notifyAssignee(taskId){
   var person = personById(task.assignee);
   if(!person || !person.email){ return; }
   syncDraftFieldsFromForm();
+
+  // Si ya sabemos que no hay cuenta conectada, no gastamos una ida al servidor.
+  if(MAIL.loaded && MAIL.configured && !MAIL.connected){
+    UI.notify[taskId] = { state:'unavailable' };
+    render();
+    toast('No se notificó a ' + person.name + ': primero conecta la cuenta de Google en Ajustes.', 'err');
+    return;
+  }
+
   UI.notify[taskId] = { state:'pending' };
   render();
-  safeUse('mcp').then(function(mcp){
-    if(!mcp){
-      UI.notify[taskId] = { state:'unavailable' };
-      render();
-      toast('No se pudo notificar a ' + person.name + ' automáticamente (Gmail no está conectado). Abre la tarea para enviar el correo manualmente.', 'err');
-      return;
-    }
-    return mcp.callTool('Gmail', 'send_message', {
-      to: [person.email],
-      subject: taskEmailSubject(task),
-      body: taskEmailBody(task, person)
-    }).then(function(){
-      UI.notify[taskId] = { state:'ok', at: new Date().toISOString() };
-      task.lastNotifiedAt = UI.notify[taskId].at;
-      render();
-      toast('Correo enviado a ' + person.name + '.', 'ok');
-      persist();
-    }).catch(function(err){
-      var code = err && err.code;
-      var msg;
-      if(code === 'needs_reauth') msg = 'Reconecta Gmail en Ajustes → Conectores.';
-      else if(code === 'server_not_connected') msg = 'Conecta Gmail en Ajustes → Conectores para enviar automáticamente.';
-      else if(code === 'not_in_manifest' || code === 'blocked_by_policy') msg = 'El envío automático no está disponible aquí.';
-      else if(code === 'approval_required') msg = 'El envío requiere aprobación en tu organización.';
-      else if(code === 'tool_error') msg = (err && err.message) ? err.message : 'Gmail no pudo enviar el correo.';
-      else msg = 'No se pudo enviar el correo automáticamente.';
-      UI.notify[taskId] = { state:'err', message: msg };
-      render();
-      // La tarea ya quedó guardada y asignada; este aviso es solo sobre el correo,
-      // así que siempre se muestra — si el correo no sale, la persona nunca se entera.
-      toast('No se notificó a ' + person.name + ' por correo: ' + msg + ' Puedes reenviarlo desde la tarea.', 'err');
+
+  /* El servidor arma el asunto y el cuerpo con la tarea tal como quedó guardada
+     en la base, así que aquí solo van los identificadores. Eso evita que este
+     endpoint sirva para mandar texto arbitrario a direcciones arbitrarias. */
+  fetch('/api/mail', {
+    method: 'POST',
+    headers: { 'Content-Type':'application/json' },
+    body: JSON.stringify({ taskId: taskId, personId: person.id })
+  }).then(function(r){
+    return r.json().catch(function(){ return {}; }).then(function(payload){
+      if(!r.ok){
+        var err = new Error(payload.error || ('HTTP ' + r.status));
+        err.code = payload.code || '';
+        throw err;
+      }
+      return payload;
     });
+  }).then(function(payload){
+    UI.notify[taskId] = { state:'ok', at: payload.sentAt, from: payload.from };
+    task.lastNotifiedAt = payload.sentAt;
+    MAIL.lastError = null;
+    render();
+    toast('Correo enviado a ' + person.name + ' desde ' + payload.from + '.', 'ok');
+    persist();
+  }).catch(function(err){
+    var msg = (err && err.message) || 'No se pudo enviar el correo.';
+    UI.notify[taskId] = { state:'err', message: msg };
+    // Si el problema es la cuenta remitente, lo reflejamos también en Ajustes.
+    if(err && err.code === 'not_connected'){ MAIL.connected = false; MAIL.lastError = msg; }
+    else if(err && (err.code === 'needs_reauth' || err.code === 'refresh_failed')){ MAIL.lastError = msg; }
+    else if(err && err.code === 'not_configured'){ MAIL.configured = false; MAIL.lastError = msg; }
+    render();
+    // La tarea ya quedó guardada y asignada; este aviso es solo sobre el correo,
+    // así que siempre se muestra — si el correo no sale, la persona nunca se entera.
+    toast('No se notificó a ' + person.name + ' por correo: ' + msg + ' Puedes reenviarlo desde la tarea.', 'err');
   });
+}
+
+/* ---------------------------- cuenta remitente (Google) ---------------------------- */
+
+function loadMailStatus(){
+  return fetch('/api/mail', { headers:{ 'Accept':'application/json' } }).then(function(r){
+    if(!r.ok) return apiError(r);
+    return r.json();
+  }).then(function(payload){
+    MAIL = {
+      loaded: true,
+      configured: !!payload.configured,
+      connected: !!payload.connected,
+      email: payload.email || null,
+      name: payload.name || null,
+      connectedAt: payload.connectedAt || null,
+      lastError: payload.lastError || null
+    };
+    render();
+    return MAIL;
+  }).catch(function(err){
+    MAIL.loaded = true;
+    MAIL.lastError = (err && err.message) || 'No se pudo consultar el estado del correo.';
+    render();
+    return MAIL;
+  });
+}
+
+function connectMailAccount(){
+  // Salimos a Google; el callback nos devuelve a "/?correo=…" con el resultado.
+  location.href = '/api/auth/google/start';
+}
+
+function askDisconnectMail(){
+  UI.confirm = {
+    kind: 'disconnect-mail', id: null, title: 'Desconectar cuenta',
+    body: 'Se dejará de enviar correo desde ' + (MAIL.email || 'esta cuenta') + '. Las notificaciones quedarán inactivas hasta que conectes otra.',
+    confirmLabel: 'Desconectar'
+  };
+  UI.modal = { type:'confirm' };
+  render();
+}
+
+function disconnectMail(){
+  closeModal();
+  fetch('/api/mail', { method:'DELETE' }).then(function(r){
+    if(!r.ok) return apiError(r);
+    return r.json();
+  }).then(function(){
+    MAIL.connected = false; MAIL.email = null; MAIL.name = null;
+    MAIL.connectedAt = null; MAIL.lastError = null;
+    render();
+    toast('Cuenta desconectada. Ya no se enviarán notificaciones.', 'ok');
+  }).catch(function(err){
+    toast('No se pudo desconectar: ' + ((err && err.message) || 'error de red'), 'err');
+  });
+}
+
+function oauthErrorText(reason){
+  var map = {
+    access_denied:       'cancelaste el permiso en la pantalla de Google.',
+    sin_permiso_envio:   'no se otorgó el permiso de envío de correo. Reintenta y acepta la casilla de "Enviar correo en tu nombre".',
+    sin_refresh_token:   'Google no entregó un permiso permanente. Retira el acceso de Toma28P en myaccount.google.com/permissions y vuelve a conectar.',
+    sin_correo:          'Google no compartió el correo de la cuenta.',
+    state_invalido:      'la solicitud de permiso caducó. Inténtalo de nuevo.',
+    respuesta_incompleta:'Google devolvió una respuesta incompleta.',
+    sin_base_de_datos:   'falta la conexión con la base de datos en Vercel.',
+    fallo_al_canjear:    'falló el canje del código con Google. Revisa GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET y la URI de redirección.',
+    redirect_uri_mismatch: 'la URI de redirección no coincide con la registrada en Google Cloud.',
+    invalid_client:      'GOOGLE_CLIENT_ID o GOOGLE_CLIENT_SECRET no son correctos.',
+    invalid_grant:       'Google rechazó el código de autorización. Inténtalo de nuevo.'
+  };
+  return map[reason] || ('motivo técnico: ' + (reason || 'desconocido'));
+}
+
+/* Al volver de Google la URL trae el resultado; lo mostramos y la limpiamos para
+   que recargar la página no repita el aviso. */
+function consumeOAuthResult(){
+  if(!location.search) return;
+  var params = new URLSearchParams(location.search);
+  var outcome = params.get('correo');
+  if(!outcome) return;
+
+  if(outcome === 'conectado'){
+    toast('Cuenta conectada: ' + (params.get('cuenta') || '') + '. Las notificaciones saldrán desde ese correo.', 'ok');
+  } else {
+    toast('No se pudo conectar la cuenta de Google — ' + oauthErrorText(params.get('motivo')), 'err');
+    UI.view = 'ajustes';
+  }
+
+  params.delete('correo'); params.delete('cuenta'); params.delete('motivo');
+  var rest = params.toString();
+  if(history.replaceState) history.replaceState(null, '', location.pathname + (rest ? '?' + rest : ''));
 }
 
 /* ---------------------------- filtrado / orden ---------------------------- */
@@ -798,7 +907,8 @@ function railHTML(){
     { id:'lista', label:'Lista', count: STATE.tasks.length, icon: iconList() },
     { id:'panel', label:'Panel', count: overdueCount > 0 ? overdueCount : null, icon: iconChart() },
     { id:'proyectos', label:'Proyectos', count: STATE.projects.length, icon: iconFolder() },
-    { id:'personas', label:'Personas', count: STATE.people.length, icon: iconPeople() }
+    { id:'personas', label:'Personas', count: STATE.people.length, icon: iconPeople() },
+    { id:'ajustes', label:'Ajustes', count: null, icon: iconGear() }
   ];
 
   var avatars = STATE.people.slice(0,5).map(function(p){
@@ -834,7 +944,8 @@ function mainHTML(){
     lista: ['Lista de tareas', 'Filtra y ordena todo el trabajo del equipo'],
     panel: ['Panel', 'Cómo va la carga de trabajo del equipo'],
     proyectos: ['Proyectos', 'Crea, renombra o elimina los proyectos y categorías del equipo'],
-    personas: ['Personas', 'Quién forma parte del equipo y a quién se notifica']
+    personas: ['Personas', 'Quién forma parte del equipo y a quién se notifica'],
+    ajustes: ['Ajustes', 'Cuenta de Google que envía las notificaciones por correo']
   };
   var t = titles[UI.view];
   var showSearch = UI.view === 'tablero' || UI.view === 'lista';
@@ -855,6 +966,7 @@ function viewBodyHTML(){
   if(UI.view === 'panel') return panelHTML();
   if(UI.view === 'proyectos') return projectsHTML();
   if(UI.view === 'personas') return peopleHTML();
+  if(UI.view === 'ajustes') return settingsHTML();
   return '';
 }
 
@@ -1139,6 +1251,71 @@ function peopleHTML(){
   return body + (STATE.people.length ? '<div style="margin-top:22px;">' + formHTML + '</div>' : (UI.readOnly ? '' : '<div style="margin-top:22px;">' + formHTML + '</div>'));
 }
 
+/* ---------------------------- Ajustes ---------------------------- */
+
+function settingsHTML(){
+  var statusHTML, actionsHTML, helpHTML = '';
+
+  if(!MAIL.loaded){
+    statusHTML = '<span class="notify-status pending">Consultando…</span>';
+    actionsHTML = '';
+  } else if(!MAIL.configured){
+    statusHTML = '<span class="notify-status err">' + iconWarn() + ' Sin credenciales de Google</span>';
+    actionsHTML = '';
+    helpHTML =
+      '<p class="muted-note" style="margin-top:10px;">Falta definir <code>GOOGLE_CLIENT_ID</code> y <code>GOOGLE_CLIENT_SECRET</code> ' +
+      'en las variables de entorno del proyecto en Vercel. Los pasos están en el archivo <strong>CONFIGURACION.md</strong> del repositorio.</p>';
+  } else if(MAIL.connected){
+    statusHTML = '<span class="notify-status ok">' + iconCheck() + ' Conectada' + (MAIL.connectedAt ? ' · ' + fmtDateTime(MAIL.connectedAt) : '') + '</span>';
+    actionsHTML =
+      '<button class="btn btn-sm" data-action="connect-mail">Cambiar de cuenta</button>' +
+      '<button class="btn btn-sm btn-ghost-danger" data-action="ask-disconnect-mail">Desconectar</button>';
+  } else {
+    statusHTML = '<span class="muted-note">Ninguna cuenta conectada todavía.</span>';
+    actionsHTML = '<button class="btn btn-accent" data-action="connect-mail">' + iconGoogle() + ' Iniciar sesión con Google</button>';
+  }
+
+  var accountHTML = MAIL.connected
+    ? '<div class="sender-account">' +
+        '<div class="avatar lg">' + esc(initials(MAIL.name || MAIL.email || '?')) + '</div>' +
+        '<div class="person-info">' +
+          '<div class="person-name">' + esc(MAIL.name || MAIL.email) + '</div>' +
+          '<div class="person-email">' + esc(MAIL.email || '') + '</div>' +
+          '<div class="person-tasks">Remitente de todas las notificaciones</div>' +
+        '</div>' +
+      '</div>'
+    : '';
+
+  var errorHTML = (MAIL.loaded && MAIL.lastError)
+    ? '<div class="notify-row"><span class="notify-status err">' + iconWarn() + ' ' + esc(MAIL.lastError) + '</span></div>'
+    : '';
+
+  return (
+    '<div class="settings-panel">' +
+      '<div class="section-label">Cuenta que envía los correos</div>' +
+      '<div class="notify-box">' +
+        '<p class="muted-note" style="font-size:12.5px; line-height:1.5;">Cuando asignas una tarea, Toma28P avisa por correo a la persona responsable. ' +
+        'Ese correo sale de la cuenta de Google con la que inicies sesión aquí, y queda registrada para todos los envíos siguientes.</p>' +
+        accountHTML +
+        '<div class="notify-row" style="justify-content:space-between; flex-wrap:wrap; gap:10px;">' +
+          statusHTML +
+          '<div style="display:flex; gap:8px; flex-wrap:wrap;">' + actionsHTML + '</div>' +
+        '</div>' +
+        errorHTML +
+        helpHTML +
+      '</div>' +
+      '<div class="section-label">Cómo funciona</div>' +
+      '<ul class="settings-list">' +
+        '<li>Se notifica automáticamente al asignar una tarea a alguien nuevo.</li>' +
+        '<li>Desde cada tarea puedes reenviar el correo con el botón <strong>Enviar correo</strong>.</li>' +
+        '<li>Solo se envía a personas registradas en <strong>Personas</strong> que tengan correo.</li>' +
+        '<li>La contraseña de Google nunca pasa por Toma28P: el permiso se guarda en el servidor y puedes retirarlo desde ' +
+          '<a class="mail-link" href="https://myaccount.google.com/permissions" target="_blank" rel="noopener">tu cuenta de Google</a>.</li>' +
+      '</ul>' +
+    '</div>'
+  );
+}
+
 /* ---------------------------- Proyectos ---------------------------- */
 
 function projectsHTML(){
@@ -1249,16 +1426,23 @@ function taskModalHTML(){
     if(notifyState && notifyState.state === 'pending') statusLine = '<span class="notify-status pending">Enviando…</span>';
     else if(notifyState && notifyState.state === 'ok') statusLine = '<span class="notify-status ok">' + iconCheck() + ' Enviado ' + fmtDateTime(notifyState.at) + '</span>';
     else if(notifyState && notifyState.state === 'err') statusLine = '<span class="notify-status err">' + iconWarn() + ' ' + esc(notifyState.message) + '</span>';
-    else if(notifyState && notifyState.state === 'unavailable') statusLine = '<span class="notify-status err">' + iconWarn() + ' Envío automático no disponible en esta vista.</span>';
+    else if(notifyState && notifyState.state === 'unavailable') statusLine = '<span class="notify-status err">' + iconWarn() + ' Falta conectar la cuenta de Google.</span>';
     else if(d.lastNotifiedAt) statusLine = '<span class="notify-status ok">' + iconCheck() + ' Notificado ' + fmtDateTime(d.lastNotifiedAt) + '</span>';
     else statusLine = '<span class="muted-note">Aún no se ha notificado.</span>';
+
+    var senderLine;
+    if(!MAIL.loaded) senderLine = '';
+    else if(!MAIL.configured) senderLine = '<div class="notify-row"><span class="muted-note">El envío de correo no está configurado en el servidor.</span></div>';
+    else if(MAIL.connected) senderLine = '<div class="notify-row"><span class="muted-note">Se enviará desde <strong>' + esc(MAIL.email) + '</strong></span></div>';
+    else senderLine = '<div class="notify-row"><span class="muted-note">Sin cuenta remitente. <button class="mail-link" style="border:none;background:none;cursor:pointer;padding:0;" data-action="go-ajustes">Conectar Google en Ajustes</button></span></div>';
 
     notifyBoxHTML = person && person.email ? (
       '<div class="notify-box">' +
         '<div class="notify-row"><span>Notificar a <strong>' + esc(person.name) + '</strong> (' + esc(person.email) + ')</span></div>' +
+        senderLine +
         '<div class="notify-row" style="justify-content:space-between;">' + statusLine +
           '<span style="display:flex; gap:12px;">' +
-            '<button class="btn btn-sm" data-action="notify" data-id="' + d.id + '" ' + (UI.readOnly?'disabled':'') + '>Enviar por Gmail</button>' +
+            '<button class="btn btn-sm" data-action="notify" data-id="' + d.id + '" ' + ((UI.readOnly || (MAIL.loaded && (!MAIL.configured || !MAIL.connected)))?'disabled':'') + '>Enviar correo</button>' +
             '<a class="mail-link" href="' + mailtoLink(d, person) + '">Abrir borrador de correo</a>' +
           '</span>' +
         '</div>' +
@@ -1398,6 +1582,15 @@ function iconClose(){ return svgWrap('<path d="M6 6l12 12M18 6L6 18"/>'); }
 function iconEdit(){ return svgWrap('<path d="M4 20l1-4.5L15.5 5 19 8.5 8.5 19z"/>'); }
 function iconTrash(){ return svgWrap('<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>'); }
 function iconLock(){ return svgWrap('<rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 018 0v3"/>'); }
+function iconGear(){ return svgWrap('<circle cx="12" cy="12" r="3.1"/><path d="M12 2.6l1.2 2.5 2.7-.5.5 2.7 2.5 1.2-1.4 2.4 1.4 2.4-2.5 1.2-.5 2.7-2.7-.5L12 21.4l-1.2-2.5-2.7.5-.5-2.7-2.5-1.2L6.5 13 5.1 10.6l2.5-1.2.5-2.7 2.7.5z"/>'); }
+function iconGoogle(){
+  return '<svg viewBox="0 0 24 24" aria-hidden="true">' +
+    '<path fill="#4285F4" d="M21.6 12.23c0-.71-.06-1.39-.18-2.05H12v3.88h5.4a4.62 4.62 0 01-2 3.03v2.52h3.23c1.89-1.74 2.97-4.3 2.97-7.38z"/>' +
+    '<path fill="#34A853" d="M12 22c2.7 0 4.96-.9 6.62-2.42l-3.23-2.52c-.9.6-2.05.96-3.39.96a5.96 5.96 0 01-5.6-4.12H3.1v2.6A10 10 0 0012 22z"/>' +
+    '<path fill="#FBBC05" d="M6.4 13.9a6.02 6.02 0 010-3.82V7.5H3.1a10 10 0 000 9l3.3-2.6z"/>' +
+    '<path fill="#EA4335" d="M12 6.06c1.47 0 2.8.51 3.84 1.5l2.87-2.87A9.97 9.97 0 003.1 7.5l3.3 2.58A5.96 5.96 0 0112 6.06z"/>' +
+  '</svg>';
+}
 function iconWarn(){ return svgWrap('<path d="M12 3l10 18H2z"/><path d="M12 10v4M12 17.5v.1"/>'); }
 function iconEmpty(kind){
   if(kind === 'people') return svgWrap('<circle cx="9" cy="8" r="3.2"/><path d="M2.5 19c.7-3.4 3.2-5.3 6.5-5.3s5.8 1.9 6.5 5.3"/><circle cx="17.5" cy="8.5" r="2.4"/><path d="M15.6 13.9c2.6.2 4.5 1.9 5.1 4.7"/>');
@@ -1488,8 +1681,12 @@ function saveTaskDraft(){
   var shouldNotify = clean.assignee && clean.assignee !== prevAssignee;
   closeModal();
   toast(wasNew ? 'Tarea creada.' : 'Cambios guardados.', 'ok');
-  if(shouldNotify) notifyAssignee(clean.id);
-  persist();
+  /* El correo lo arma el servidor leyendo la tarea desde la base, así que primero
+     tiene que estar guardada. Si el guardado falla no se notifica: sería avisar de
+     una tarea que nadie más puede ver. */
+  persist().then(function(ok){
+    if(ok && shouldNotify) notifyAssignee(clean.id);
+  });
 }
 
 function askDeleteTask(id){
@@ -1821,6 +2018,9 @@ function bindEvents(){
     if(action === 'add-comment'){ addCommentFromInput(); return; }
     if(action === 'change-name'){ promptChangeName(); return; }
     if(action === 'notify'){ notifyAssignee(id); return; }
+    if(action === 'connect-mail'){ connectMailAccount(); return; }
+    if(action === 'ask-disconnect-mail'){ askDisconnectMail(); return; }
+    if(action === 'go-ajustes'){ closeModal(); UI.view = 'ajustes'; render(); return; }
     if(action === 'add-person'){ addPerson(); return; }
     if(action === 'new-person'){ UI.view='personas'; render(); setTimeout(openNewPersonForm, 30); return; }
     if(action === 'edit-person'){ openEditPerson(id); return; }
@@ -1844,6 +2044,7 @@ function bindEvents(){
       else if(confirmKind === 'delete-person') deletePerson(confirmId);
       else if(confirmKind === 'delete-project') deleteProject(confirmId);
       else if(confirmKind === 'delete-board') deleteBoard(confirmId);
+      else if(confirmKind === 'disconnect-mail') disconnectMail();
       return;
     }
     if(action === 'clear-filters'){ UI.filters = { project:'all', assignee:'all', status:'all', priority:'all', tag:'all' }; render(); return; }
@@ -1916,15 +2117,11 @@ function init(){
   // Solo lectura hasta que la base confirme: así nadie escribe sobre un estado sin cargar.
   UI.readOnly = true;
   render();
+  consumeOAuthResult();
   loadFromServer();
+  loadMailStatus();
 }
 
-// Algunos anfitriones (ej. vistas previas de archivos) exponen un window.claude
-// incompleto (existe, pero sin un .use funcional) en vez de dejarlo undefined.
-// Cubrimos ambos casos para que la app nunca dependa de esto para funcionar.
-if(typeof window.claude === 'undefined' || typeof window.claude.use !== 'function'){
-  window.claude = { use: function(){ return Promise.resolve(null); } };
-}
 window.addEventListener('error', function(ev){
   console.error('Toma28P: error no capturado —', ev.message);
 });
